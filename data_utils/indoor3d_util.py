@@ -74,6 +74,51 @@ def collect_point_label(anno_path, out_filename, file_format='txt'):
             (file_format))
         exit()
 
+def collect_point_label_inst(anno_path, out_filename, file_format='txt'):
+    """ Convert original dataset files to data_label file (each line is XYZRGBL).
+        We aggregated all the points from each instance in the room.
+
+    Args:
+        anno_path: path to annotations. e.g. Area_1/office_2/Annotations/
+        out_filename: path to save collected points and labels (each line is XYZRGBL)
+        file_format: txt or numpy, determines what file format to save.
+    Returns:
+        None
+    Note:
+        the points are shifted before save, the most negative point is now at origin.
+    """
+    points_list = []
+
+    # Each .txt file is labelled an instance number for that room
+    instance_idx = 0
+    for f in glob.glob(os.path.join(anno_path, '*.txt')):
+        print(f)
+
+        points = np.loadtxt(f)
+        labels = np.ones((points.shape[0],1)) * instance_idx
+        points_list.append(np.concatenate([points, labels], 1)) # Nx7
+        
+        instance_idx += 1
+
+    data_label = np.concatenate(points_list, 0)
+    xyz_min = np.amin(data_label, axis=0)[0:3]
+    data_label[:, 0:3] -= xyz_min
+    
+    if file_format=='txt':
+        fout = open(out_filename, 'w')
+        for i in range(data_label.shape[0]):
+            fout.write('%f %f %f %d %d %d %d\n' % \
+                          (data_label[i,0], data_label[i,1], data_label[i,2],
+                           data_label[i,3], data_label[i,4], data_label[i,5],
+                           data_label[i,6]))
+        fout.close()
+    elif file_format=='numpy':
+        np.save(out_filename, data_label)
+    else:
+        print('ERROR!! Unknown file format: %s, please use txt or numpy.' % \
+            (file_format))
+        exit()
+
 def data_to_obj(data,name='example.obj',no_wall=True):
     fout = open(name, 'w')
     label = data[:, -1].astype(int)
