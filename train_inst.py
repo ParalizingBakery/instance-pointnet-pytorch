@@ -4,7 +4,7 @@ Date: Nov 2019
 """
 import argparse
 import os
-from data_utils.S3DISDataLoader import S3DISDataset
+from data_utils.S3DISDataLoader_inst import S3DISDataset
 import torch
 import datetime
 import logging
@@ -16,18 +16,19 @@ from tqdm import tqdm
 import provider
 import numpy as np
 import time
+from pytorch_metric_learning import losses, miners
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
 sys.path.append(os.path.join(ROOT_DIR, 'models'))
 
-classes = ['ceiling', 'floor', 'wall', 'beam', 'column', 'window', 'door', 'table', 'chair', 'sofa', 'bookcase',
-           'board', 'clutter']
-class2label = {cls: i for i, cls in enumerate(classes)}
-seg_classes = class2label
-seg_label_to_cat = {}
-for i, cat in enumerate(seg_classes.keys()):
-    seg_label_to_cat[i] = cat
+# classes = ['ceiling', 'floor', 'wall', 'beam', 'column', 'window', 'door', 'table', 'chair', 'sofa', 'bookcase',
+#            'board', 'clutter']
+# class2label = {cls: i for i, cls in enumerate(classes)}
+# seg_classes = class2label
+# seg_label_to_cat = {}
+# for i, cat in enumerate(seg_classes.keys()):
+    # seg_label_to_cat[i] = cat
 
 def inplace_relu(m):
     classname = m.__class__.__name__
@@ -48,6 +49,9 @@ def parse_args():
     parser.add_argument('--step_size', type=int, default=10, help='Decay step for lr decay [default: every 10 epochs]')
     parser.add_argument('--lr_decay', type=float, default=0.7, help='Decay rate for lr decay [default: 0.7]')
     parser.add_argument('--test_area', type=int, default=5, help='Which area to use for test, option: 1-6 [default: 5]')
+    parser.add_argument('--pos_strategy', type=str, default='easy', help='pos_strategy string')
+    parser.add_argument('--neg_strategy', type=str, default='semihard', help='neg_strategy string')
+    parser.add_argument('--margin', type=float, default=0.05, help='margin for triplet loss')
 
     return parser.parse_args()
 
@@ -88,8 +92,8 @@ def main(args):
     log_string('PARAMETER ...')
     log_string(args)
 
-    root = 'data/stanford_indoor3d/'
-    NUM_CLASSES = 13
+    root = 'data/stanford_indoor3d_inst/'
+    NUM_DIMENSIONS = 128
     NUM_POINT = args.npoint
     BATCH_SIZE = args.batch_size
 
@@ -103,7 +107,7 @@ def main(args):
                                                   worker_init_fn=lambda x: np.random.seed(x + int(time.time())))
     testDataLoader = torch.utils.data.DataLoader(TEST_DATASET, batch_size=BATCH_SIZE, shuffle=False, num_workers=10,
                                                  pin_memory=True, drop_last=True)
-    weights = torch.Tensor(TRAIN_DATASET.labelweights).cuda()
+    # weights = torch.Tensor(TRAIN_DATASET.labelweights).cuda()
 
     log_string("The number of training data is: %d" % len(TRAIN_DATASET))
     log_string("The number of test data is: %d" % len(TEST_DATASET))
@@ -113,8 +117,10 @@ def main(args):
     shutil.copy('models/%s.py' % args.model, str(experiment_dir))
     shutil.copy('models/pointnet2_utils.py', str(experiment_dir))
 
-    classifier = MODEL.get_model(NUM_CLASSES).cuda()
-    criterion = MODEL.get_loss().cuda()
+    classifier = MODEL.get_model(NUM_DIMENSIONS).cuda()
+    criterion = losses.TripletMarginLoss(margin = args.margin)
+    miner_func = miners.BatchEasyHardMiner(pos_strategy=args.pos_strategy, neg_strategy=args.neg_strategy)
+
     classifier.apply(inplace_relu)
 
     def weights_init(m):
@@ -158,6 +164,7 @@ def main(args):
 
     global_epoch = 0
     best_iou = 0
+    lowest_loss = float('inf')
 
     for epoch in range(start_epoch, args.epoch):
         '''Train on chopped scenes'''
@@ -186,26 +193,35 @@ def main(args):
             points, target = points.float().cuda(), target.long().cuda()
             points = points.transpose(2, 1)
 
+            # output of model is [B, N, D]
             seg_pred, trans_feat = classifier(points)
-            seg_pred = seg_pred.contiguous().view(-1, NUM_CLASSES)
-
-            batch_label = target.view(-1, 1)[:, 0].cpu().data.numpy()
-            target = target.view(-1, 1)[:, 0]
-            loss = criterion(seg_pred, target, trans_feat, weights)
+            # seg_pred = seg_pred.contiguous().view(-1, NUM_DIMENSIONS)
+            
+            # Instance Labels are per-room, not global across 6 areas
+            # One way to optimise is to make mining and loss parallel across samples
+            batch_loss_sum = torch.tensor(0.0).cuda()
+            for sample_idx in range(seg_pred.shape[0]):
+                # Mine triplets, default pos=easy and neg=semihard
+                sample_embed = seg_pred[sample_idx]
+                sample_target = target[sample_idx]
+                miner_output = miner_func(sample_embed, sample_target)
+                batch_loss_sum += criterion(sample_embed, sample_target, miner_output)
+            
+            loss = batch_loss_sum / args.batch_size
             loss.backward()
             optimizer.step()
 
-            pred_choice = seg_pred.cpu().data.max(1)[1].numpy()
-            correct = np.sum(pred_choice == batch_label)
-            total_correct += correct
-            total_seen += (BATCH_SIZE * NUM_POINT)
+            # pred_choice = seg_pred.cpu().data.max(1)[1].numpy()
+            # correct = np.sum(pred_choice == batch_label)
+            # total_correct += correct
+            # total_seen += (BATCH_SIZE * NUM_POINT)
             loss_sum += loss
         log_string('Training mean loss: %f' % (loss_sum / num_batches))
-        log_string('Training accuracy: %f' % (total_correct / float(total_seen)))
+        # log_string('Training accuracy: %f' % (total_correct / float(total_seen)))
 
         if epoch % 5 == 0:
             logger.info('Save model...')
-            savepath = str(checkpoints_dir) + '/model.pth'
+            savepath = str(checkpoints_dir) + f'/model_{epoch}.pth'
             log_string('Saving at %s' % savepath)
             state = {
                 'epoch': epoch,
@@ -218,13 +234,13 @@ def main(args):
         '''Evaluate on chopped scenes'''
         with torch.no_grad():
             num_batches = len(testDataLoader)
-            total_correct = 0
-            total_seen = 0
+            # total_correct = 0
+            # total_seen = 0
             loss_sum = 0
-            labelweights = np.zeros(NUM_CLASSES)
-            total_seen_class = [0 for _ in range(NUM_CLASSES)]
-            total_correct_class = [0 for _ in range(NUM_CLASSES)]
-            total_iou_deno_class = [0 for _ in range(NUM_CLASSES)]
+            # labelweights = np.zeros(NUM_CLASSES)
+            # total_seen_class = [0 for _ in range(NUM_CLASSES)]
+            # total_correct_class = [0 for _ in range(NUM_CLASSES)]
+            # total_iou_deno_class = [0 for _ in range(NUM_CLASSES)]
             classifier = classifier.eval()
 
             log_string('---- EPOCH %03d EVALUATION ----' % (global_epoch + 1))
@@ -236,56 +252,62 @@ def main(args):
 
                 seg_pred, trans_feat = classifier(points)
                 pred_val = seg_pred.contiguous().cpu().data.numpy()
-                seg_pred = seg_pred.contiguous().view(-1, NUM_CLASSES)
 
-                batch_label = target.cpu().data.numpy()
-                target = target.view(-1, 1)[:, 0]
-                loss = criterion(seg_pred, target, trans_feat, weights)
+                batch_loss_sum = torch.tensor(0.0).cuda()
+                for sample_idx in range(seg_pred.shape[0]):
+                    sample_embed = seg_pred[sample_idx]
+                    sample_target = target[sample_idx]
+                    batch_loss_sum += criterion(sample_embed, sample_target)
+
+                # batch_label = target.cpu().data.numpy()
+                # target = target.view(-1, 1)[:, 0]
+                loss = batch_loss_sum / args.batch_size
                 loss_sum += loss
-                pred_val = np.argmax(pred_val, 2)
-                correct = np.sum((pred_val == batch_label))
-                total_correct += correct
-                total_seen += (BATCH_SIZE * NUM_POINT)
-                tmp, _ = np.histogram(batch_label, range(NUM_CLASSES + 1))
-                labelweights += tmp
+                # pred_val = np.argmax(pred_val, 2)
+                # correct = np.sum((pred_val == batch_label))
+                # total_correct += correct
+                # total_seen += (BATCH_SIZE * NUM_POINT)
+                # tmp, _ = np.histogram(batch_label, range(NUM_CLASSES + 1))
+                # labelweights += tmp
 
-                for l in range(NUM_CLASSES):
-                    total_seen_class[l] += np.sum((batch_label == l))
-                    total_correct_class[l] += np.sum((pred_val == l) & (batch_label == l))
-                    total_iou_deno_class[l] += np.sum(((pred_val == l) | (batch_label == l)))
+                # for l in range(NUM_CLASSES):
+                #     total_seen_class[l] += np.sum((batch_label == l))
+                #     total_correct_class[l] += np.sum((pred_val == l) & (batch_label == l))
+                #     total_iou_deno_class[l] += np.sum(((pred_val == l) | (batch_label == l)))
 
-            labelweights = labelweights.astype(np.float32) / np.sum(labelweights.astype(np.float32))
-            mIoU = np.mean(np.array(total_correct_class) / (np.array(total_iou_deno_class, dtype=float) + 1e-6))
-            log_string('eval mean loss: %f' % (loss_sum / float(num_batches)))
-            log_string('eval point avg class IoU: %f' % (mIoU))
-            log_string('eval point accuracy: %f' % (total_correct / float(total_seen)))
-            log_string('eval point avg class acc: %f' % (
-                np.mean(np.array(total_correct_class) / (np.array(total_seen_class, dtype=float) + 1e-6))))
+            # labelweights = labelweights.astype(np.float32) / np.sum(labelweights.astype(np.float32))
+            # mIoU = np.mean(np.array(total_correct_class) / (np.array(total_iou_deno_class, dtype=float) + 1e-6))
+            mean_loss = loss_sum / float(num_batches)
+            log_string('eval mean loss: %f' % (mean_loss))
+            # log_string('eval point avg class IoU: %f' % (mIoU))
+            # log_string('eval point accuracy: %f' % (total_correct / float(total_seen)))
+            # log_string('eval point avg class acc: %f' % (
+            #     np.mean(np.array(total_correct_class) / (np.array(total_seen_class, dtype=float) + 1e-6))))
 
-            iou_per_class_str = '------- IoU --------\n'
-            for l in range(NUM_CLASSES):
-                iou_per_class_str += 'class %s weight: %.3f, IoU: %.3f \n' % (
-                    seg_label_to_cat[l] + ' ' * (14 - len(seg_label_to_cat[l])), labelweights[l - 1],
-                    total_correct_class[l] / float(total_iou_deno_class[l]))
+            # iou_per_class_str = '------- IoU --------\n'
+            # for l in range(NUM_CLASSES):
+            #     iou_per_class_str += 'class %s weight: %.3f, IoU: %.3f \n' % (
+            #         # seg_label_to_cat[l] + ' ' * (14 - len(seg_label_to_cat[l])), labelweights[l - 1],
+            #         total_correct_class[l] / float(total_iou_deno_class[l]))
 
-            log_string(iou_per_class_str)
+            # log_string(iou_per_class_str)
             log_string('Eval mean loss: %f' % (loss_sum / num_batches))
-            log_string('Eval accuracy: %f' % (total_correct / float(total_seen)))
+            # log_string('Eval accuracy: %f' % (total_correct / float(total_seen)))
 
-            if mIoU >= best_iou:
-                best_iou = mIoU
+            if mean_loss <= lowest_loss:
+                lowest_loss = mean_loss
                 logger.info('Save model...')
                 savepath = str(checkpoints_dir) + '/best_model.pth'
                 log_string('Saving at %s' % savepath)
                 state = {
                     'epoch': epoch,
-                    'class_avg_iou': mIoU,
+                    'eval_avg_loss': mean_loss,
                     'model_state_dict': classifier.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }
                 torch.save(state, savepath)
                 log_string('Saving model....')
-            log_string('Best mIoU: %f' % best_iou)
+            log_string('Lowest loss: %f' % lowest_loss)
         global_epoch += 1
 
 
