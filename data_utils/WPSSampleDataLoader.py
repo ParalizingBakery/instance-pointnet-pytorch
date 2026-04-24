@@ -11,23 +11,14 @@ class ScannetDatasetWholeScene:
         self,
         root,
         block_points=4096,
-        split="test",
-        test_area=5,
-        stride=0.5,
         block_size=1.0,
-        padding=0.001,
         struct_coord_min=None,
         struct_coord_max=None,
     ):
         self.block_points = block_points
         self.block_size = block_size
-        # for floating point imprecision, so points between grid are counted
-        self.padding = padding
         self.root = root
-        self.split = split
-        self.stride = stride
         self.scene_points_num = []
-        assert split in ["train", "test"]
 
         self.file_list = sorted([d for d in os.listdir(root)])
 
