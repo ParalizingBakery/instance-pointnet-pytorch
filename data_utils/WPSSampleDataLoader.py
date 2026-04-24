@@ -73,16 +73,14 @@ class ScannetDatasetWholeScene:
 
         sample_min = np.amin(points[:, :3], axis=0)
         point_idxs = np.arange(0, points.shape[0])
-        
+
         if point_idxs.size == 0:
             raise Exception("No points for sample")
         num_batch = int(np.ceil(point_idxs.size / self.block_points))
         point_size = int(num_batch * self.block_points)
-        
+
         # duplicate points to a multiple of self.block_points
-        replace = (
-            False if (point_size - point_idxs.size <= point_idxs.size) else True
-        )
+        replace = False if (point_size - point_idxs.size <= point_idxs.size) else True
         point_idxs_repeat = np.random.choice(
             point_idxs, point_size - point_idxs.size, replace=replace
         )
@@ -92,8 +90,12 @@ class ScannetDatasetWholeScene:
         normlized_xyz = np.zeros((point_size, 3))
 
         # For XY, normalize within structure
-        normlized_xyz[:, 0] = (data_batch[:, 0] - coord_min[0]) / (coord_max[0] - coord_min[0])
-        normlized_xyz[:, 1] = (data_batch[:, 1] - coord_min[1]) / (coord_max[1] - coord_min[1])
+        normlized_xyz[:, 0] = (data_batch[:, 0] - coord_min[0]) / (
+            coord_max[0] - coord_min[0]
+        )
+        normlized_xyz[:, 1] = (data_batch[:, 1] - coord_min[1]) / (
+            coord_max[1] - coord_min[1]
+        )
 
         # For Z axis, normalize within sample
         normlized_xyz[:, 2] = (data_batch[:, 2] - sample_min[2]) / np.max(points[:, 2])
@@ -107,18 +109,12 @@ class ScannetDatasetWholeScene:
 
         # Possible optimization: stacking copies both array to new index
         # Keeping them as a list then stacking once should be faster
-        data_room = (
-            np.vstack([data_room, data_batch]) if data_room.size else data_batch
-        )
+        data_room = np.vstack([data_room, data_batch]) if data_room.size else data_batch
         label_room = (
-            np.hstack([label_room, label_batch])
-            if label_room.size
-            else label_batch
+            np.hstack([label_room, label_batch]) if label_room.size else label_batch
         )
         index_room = (
-            np.hstack([index_room, point_idxs])
-            if index_room.size
-            else point_idxs
+            np.hstack([index_room, point_idxs]) if index_room.size else point_idxs
         )
         data_room = data_room.reshape((-1, self.block_points, data_room.shape[1]))
         label_room = label_room.reshape((-1, self.block_points))
