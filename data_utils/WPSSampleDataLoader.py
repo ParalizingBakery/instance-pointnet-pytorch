@@ -29,7 +29,7 @@ class ScannetDatasetWholeScene:
         self.scene_points_num = []
         assert split in ["train", "test"]
 
-        self.file_list = [d for d in os.listdir(root)]
+        self.file_list = sorted([d for d in os.listdir(root)])
 
         self.scene_points_list = []
         self.semantic_labels_list = []
@@ -98,11 +98,13 @@ class ScannetDatasetWholeScene:
         )
 
         # For Z axis, normalize within sample
-        normlized_xyz[:, 2] = (data_batch[:, 2] - sample_min[2]) / np.max(points[:, 2])
+        normlized_xyz[:, 2] = (data_batch[:, 2] - sample_min[2]) / (np.max(points[:, 2] - sample_min[2]))
 
         # normalize sample xy to [-0.5, 0.5] when bs is 1.0
+        # for Z, still use absolute scale but set min to 0
         data_batch[:, 0] = data_batch[:, 0] - (sample_min[0] + (self.block_size / 2.0))
         data_batch[:, 1] = data_batch[:, 1] - (sample_min[1] + (self.block_size / 2.0))
+        data_batch[:, 2] = data_batch[:, 2] - sample_min[2]
         data_batch[:, 3:6] /= 255.0
         data_batch = np.concatenate((data_batch, normlized_xyz), axis=1)
         label_batch = labels[point_idxs].astype(int)
@@ -124,3 +126,11 @@ class ScannetDatasetWholeScene:
 
     def __len__(self):
         return len(self.scene_points_list)
+
+if __name__ == "__main__":
+    loader = ScannetDatasetWholeScene("data/wps_collected")
+    data, labels, _, index = loader[0]
+
+    # (N, 4096, 9)
+    print(data.shape)
+    np.savetxt('test_points_0.txt', data.reshape((-1, 9)))
