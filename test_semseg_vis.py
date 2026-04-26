@@ -38,6 +38,7 @@ def parse_args():
     parser.add_argument('--visual', action='store_true', default=False, help='visualize result [default: False]')
     parser.add_argument('--test_area', type=int, default=5, help='area for testing, option: 1-6 [default: 5]')
     parser.add_argument('--num_votes', type=int, default=3, help='aggregate segmentation scores with voting [default: 5]')
+    parser.add_argument('--model', type=str)
     return parser.parse_args()
 
 
@@ -85,12 +86,16 @@ def main(args):
     log_string("The number of test data is: %d" % len(TEST_DATASET_WHOLE_SCENE))
 
     '''MODEL LOADING'''
-    model_name = os.listdir(experiment_dir + '/logs')[0].split('.')[0]
+    model_name = args.model
+    if args.model is None:
+        # Insane logic: model name from file order
+        model_name = os.listdir(experiment_dir + '/logs')[0].split('.')[0]
     MODEL = importlib.import_module(model_name)
     classifier = MODEL.get_model(NUM_CLASSES).cuda()
     checkpoint = torch.load(str(experiment_dir) + '/checkpoints/best_model.pth', weights_only=False)
     classifier.load_state_dict(checkpoint['model_state_dict'])
     classifier = classifier.eval()
+    test_sim = True
 
     with torch.no_grad():
         scene_id = TEST_DATASET_WHOLE_SCENE.file_list
@@ -138,7 +143,15 @@ def main(args):
                     torch_data = torch.Tensor(batch_data)
                     torch_data = torch_data.float().cuda()
                     torch_data = torch_data.transpose(2, 1)
-                    seg_pred, _ = classifier(torch_data)
+                    seg_pred, embeddings = classifier(torch_data)
+                    
+                    if test_sim:
+                        sim = torch.nn.functional.cosine_similarity(torch.unsqueeze(embeddings[0][0], 0), embeddings[0], 1)
+                        print(seg_pred.shape)
+                        print(embeddings[0][0].shape, embeddings[0].shape,  sim.shape)
+                        np.savetxt('test_similarity.txt', np.column_stack((batch_data[0], sim.cpu())))
+                        test_sim = False
+                    
                     
                     batch_pred_label = seg_pred.contiguous().cpu().data.max(2)[1].numpy()
 
