@@ -2,7 +2,7 @@ import os
 import numpy as np
 
 from tqdm import tqdm
-from torch.utils.data import Dataset
+from torch.utils.data import D`ataset
 
 
 class ScannetDatasetWholeScene:
@@ -92,8 +92,15 @@ class ScannetDatasetWholeScene:
             coord_max[1] - coord_min[1]
         )
 
-        # For Z axis, normalize within sample
-        normlized_xyz[:, 2] = (data_batch[:, 2] - sample_min[2]) / (np.max(points[:, 2] - sample_min[2]))
+        # For Z axis, normalize within sample if more than 3 m.
+        # For S3DIS they are normalized by max room height, which is usually 3
+        z_max = np.max(points[:, 2])
+        if z_max - coord_min[2] < 3.0:
+            normlized_xyz[:, 2] = (data_batch[:, 2] - sample_min[2]) / 3.0
+        else:
+            normlized_xyz[:, 2] = (data_batch[:, 2] - sample_min[2]) / (
+                z_max - sample_min[2]
+            )
 
         # normalize sample xy to [-0.5, 0.5] when bs is 1.0
         # for Z, still use absolute scale but set min to 0
@@ -123,7 +130,7 @@ class ScannetDatasetWholeScene:
         return len(self.scene_points_list)
 
 if __name__ == "__main__":
-    loader = ScannetDatasetWholeScene("data/wps_collected")
+    loader = ScannetDatasetWholeScene("data/wps_collected", struct_coord_min=[-102.078, 46.68, 37.79], struct_coord_max=[-66.824, 80.07, 75.4])
     data, labels, _, index = loader[0]
 
     # (N, 4096, 9)
