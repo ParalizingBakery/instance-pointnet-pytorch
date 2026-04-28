@@ -80,6 +80,10 @@ class ScannetDatasetWholeScene:
         data_batch = points[point_idxs, :]
         normlized_xyz = np.zeros((point_size, 3))
 
+        # Readded Sample weights because zero weights (filler points for filling up to batch size)
+        # Has to be discarded using weights
+        sample_weight = np.ones((point_size))
+
         # For XY, normalize within structure
         normlized_xyz[:, 0] = (data_batch[:, 0] - coord_min[0]) / (
             coord_max[0] - coord_min[0]
