@@ -17,6 +17,7 @@ import provider
 import numpy as np
 import time
 from pytorch_metric_learning import losses, miners
+from pytorch_metric_learning.utils.accuracy_calculator import AccuracyCalculator
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
@@ -28,7 +29,7 @@ sys.path.append(os.path.join(ROOT_DIR, 'models'))
 # seg_classes = class2label
 # seg_label_to_cat = {}
 # for i, cat in enumerate(seg_classes.keys()):
-    # seg_label_to_cat[i] = cat
+# seg_label_to_cat[i] = cat
 
 def inplace_relu(m):
     classname = m.__class__.__name__
@@ -52,6 +53,10 @@ def parse_args():
     parser.add_argument('--pos_strategy', type=str, default='easy', help='pos_strategy string')
     parser.add_argument('--neg_strategy', type=str, default='semihard', help='neg_strategy string')
     parser.add_argument('--margin', type=float, default=0.05, help='margin for triplet loss')
+    parser.add_argument('--test_sample_rate', type=float, default=0.25, help='nultiplier for number of points in embedding evaluation')
+    parser.add_argument('--eval_num_points', type=float, default=2048, help='points to randomly select for each sample eval')
+    parser.add_argument('--save_epoch', type=int, default=3, help='save every n epochs')
+    parser.add_argument('--data_root', type=str, default='data/stanford_indoor3d_inst/', help='location of collected data')
 
     return parser.parse_args()
 
@@ -92,7 +97,7 @@ def main(args):
     log_string('PARAMETER ...')
     log_string(args)
 
-    root = 'data/stanford_indoor3d_inst/'
+    root = args.data_root
     NUM_DIMENSIONS = 128
     NUM_POINT = args.npoint
     BATCH_SIZE = args.batch_size
@@ -100,7 +105,7 @@ def main(args):
     print("start loading training data ...")
     TRAIN_DATASET = S3DISDataset(split='train', data_root=root, num_point=NUM_POINT, test_area=args.test_area, block_size=1.0, sample_rate=1.0, transform=None)
     print("start loading test data ...")
-    TEST_DATASET = S3DISDataset(split='test', data_root=root, num_point=NUM_POINT, test_area=args.test_area, block_size=1.0, sample_rate=1.0, transform=None)
+    TEST_DATASET = S3DISDataset(split='test', data_root=root, num_point=NUM_POINT, test_area=args.test_area, block_size=1.0, sample_rate=args.test_sample_rate, transform=None)
 
     trainDataLoader = torch.utils.data.DataLoader(TRAIN_DATASET, batch_size=BATCH_SIZE, shuffle=True, num_workers=10,
                                                   pin_memory=True, drop_last=True,
@@ -118,6 +123,8 @@ def main(args):
     shutil.copy('models/pointnet2_utils.py', str(experiment_dir))
 
     classifier = MODEL.get_model(NUM_DIMENSIONS).cuda()
+    # miner and loss using cpu is faster 1.6it/s from 1.3it/s using cuda
+    # probably because they are called per sample
     criterion = losses.TripletMarginLoss(margin = args.margin)
     miner_func = miners.BatchEasyHardMiner(pos_strategy=args.pos_strategy, neg_strategy=args.neg_strategy)
 
@@ -163,8 +170,7 @@ def main(args):
     MOMENTUM_DECCAY_STEP = args.step_size
 
     global_epoch = 0
-    best_iou = 0
-    lowest_loss = float('inf')
+    highest_mapr = 0.0
 
     for epoch in range(start_epoch, args.epoch):
         '''Train on chopped scenes'''
@@ -184,7 +190,7 @@ def main(args):
         loss_sum = 0
         classifier = classifier.train()
 
-        for i, (points, target) in tqdm(enumerate(trainDataLoader), total=len(trainDataLoader), smoothing=0.9):
+        for i, (points, target, room_idx) in tqdm(enumerate(trainDataLoader), total=len(trainDataLoader), smoothing=0.9):
             optimizer.zero_grad()
 
             points = points.data.numpy()
@@ -196,7 +202,7 @@ def main(args):
             # output of model is [B, N, D]
             seg_pred, trans_feat = classifier(points)
             # seg_pred = seg_pred.contiguous().view(-1, NUM_DIMENSIONS)
-            
+
             # Instance Labels are per-room, not global across 6 areas
             # One way to optimise is to make mining and loss parallel across samples
             batch_loss_sum = torch.tensor(0.0).cuda()
@@ -206,7 +212,7 @@ def main(args):
                 sample_target = target[sample_idx]
                 miner_output = miner_func(sample_embed, sample_target)
                 batch_loss_sum += criterion(sample_embed, sample_target, miner_output)
-            
+
             loss = batch_loss_sum / args.batch_size
             loss.backward()
             optimizer.step()
@@ -219,7 +225,7 @@ def main(args):
         log_string('Training mean loss: %f' % (loss_sum / num_batches))
         # log_string('Training accuracy: %f' % (total_correct / float(total_seen)))
 
-        if epoch % 5 == 0:
+        if epoch % args.save_epoch == 0:
             logger.info('Save model...')
             savepath = str(checkpoints_dir) + f'/model_{epoch}.pth'
             log_string('Saving at %s' % savepath)
@@ -231,83 +237,107 @@ def main(args):
             torch.save(state, savepath)
             log_string('Saving model....')
 
+        SAMPLE_POINTS = args.eval_num_points
+        FAISS_GPU_POINTS = 2048
+        MAX_INST = 500
         '''Evaluate on chopped scenes'''
         with torch.no_grad():
             num_batches = len(testDataLoader)
-            # total_correct = 0
-            # total_seen = 0
-            loss_sum = 0
-            # labelweights = np.zeros(NUM_CLASSES)
-            # total_seen_class = [0 for _ in range(NUM_CLASSES)]
-            # total_correct_class = [0 for _ in range(NUM_CLASSES)]
-            # total_iou_deno_class = [0 for _ in range(NUM_CLASSES)]
+            loss_sum = 0.0
+            mapr_sum = 0.0
             classifier = classifier.eval()
 
             log_string('---- EPOCH %03d EVALUATION ----' % (global_epoch + 1))
-            for i, (points, target) in tqdm(enumerate(testDataLoader), total=len(testDataLoader), smoothing=0.9):
+            for i, (points, target, room_idx) in tqdm(enumerate(testDataLoader), total=len(testDataLoader), smoothing=0.9):
                 points = points.data.numpy()
                 points = torch.Tensor(points)
-                points, target = points.float().cuda(), target.long().cuda()
+                points, target = (
+                    points.float().cuda(),
+                    target.long().cuda().contiguous(),
+                )
                 points = points.transpose(2, 1)
 
-                seg_pred, trans_feat = classifier(points)
-                pred_val = seg_pred.contiguous().cpu().data.numpy()
+                embed_pred, trans_feat = classifier(points)
+                SAMPLES_PER_CHUNK = int(FAISS_GPU_POINTS / SAMPLE_POINTS)
 
                 batch_loss_sum = torch.tensor(0.0).cuda()
-                for sample_idx in range(seg_pred.shape[0]):
-                    sample_embed = seg_pred[sample_idx]
-                    sample_target = target[sample_idx]
-                    batch_loss_sum += criterion(sample_embed, sample_target)
+                batch_mapr_sum = torch.tensor(0.0)
 
-                # batch_label = target.cpu().data.numpy()
-                # target = target.view(-1, 1)[:, 0]
-                loss = batch_loss_sum / args.batch_size
-                loss_sum += loss
-                # pred_val = np.argmax(pred_val, 2)
-                # correct = np.sum((pred_val == batch_label))
-                # total_correct += correct
-                # total_seen += (BATCH_SIZE * NUM_POINT)
-                # tmp, _ = np.histogram(batch_label, range(NUM_CLASSES + 1))
-                # labelweights += tmp
+                # Generate subsample for each batch of size 512, [B, EVAL_POINTS]
+                all_indices = torch.stack(
+                    [
+                        torch.randperm(NUM_POINT, device=embed_pred.device)[
+                            :SAMPLE_POINTS
+                        ]
+                        for _ in range(BATCH_SIZE)
+                    ]
+                )
 
-                # for l in range(NUM_CLASSES):
-                #     total_seen_class[l] += np.sum((batch_label == l))
-                #     total_correct_class[l] += np.sum((pred_val == l) & (batch_label == l))
-                #     total_iou_deno_class[l] += np.sum(((pred_val == l) | (batch_label == l)))
+                for start_chunk in range(0, BATCH_SIZE, SAMPLES_PER_CHUNK):
+                    end_chunk = min(BATCH_SIZE, start_chunk + SAMPLES_PER_CHUNK)
+                    chunk_indices = all_indices[start_chunk:end_chunk]
 
-            # labelweights = labelweights.astype(np.float32) / np.sum(labelweights.astype(np.float32))
-            # mIoU = np.mean(np.array(total_correct_class) / (np.array(total_iou_deno_class, dtype=float) + 1e-6))
-            mean_loss = loss_sum / float(num_batches)
-            log_string('eval mean loss: %f' % (mean_loss))
-            # log_string('eval point avg class IoU: %f' % (mIoU))
-            # log_string('eval point accuracy: %f' % (total_correct / float(total_seen)))
-            # log_string('eval point avg class acc: %f' % (
-            #     np.mean(np.array(total_correct_class) / (np.array(total_seen_class, dtype=float) + 1e-6))))
+                    # Expand to [SELECTED_SAMPLES, EVAL_POINTS, D]
+                    chunk_embed_indices = chunk_indices.unsqueeze(-1).expand(
+                        -1, -1, NUM_DIMENSIONS
+                    )
 
-            # iou_per_class_str = '------- IoU --------\n'
-            # for l in range(NUM_CLASSES):
-            #     iou_per_class_str += 'class %s weight: %.3f, IoU: %.3f \n' % (
-            #         # seg_label_to_cat[l] + ' ' * (14 - len(seg_label_to_cat[l])), labelweights[l - 1],
-            #         total_correct_class[l] / float(total_iou_deno_class[l]))
+                    chunk_embed = (
+                        torch.gather(
+                            embed_pred[start_chunk:end_chunk], 1, chunk_embed_indices
+                        )
+                        .reshape(-1, NUM_DIMENSIONS)
+                        .contiguous()
+                    )
 
-            # log_string(iou_per_class_str)
-            log_string('Eval mean loss: %f' % (loss_sum / num_batches))
-            # log_string('Eval accuracy: %f' % (total_correct / float(total_seen)))
+                    # Add an Offset to each room so instances from same room are the same
+                    chunk_target = torch.gather(
+                        target[start_chunk:end_chunk], 1, chunk_indices
+                    ).contiguous()
+                    room_offsets = (
+                        room_idx[start_chunk:end_chunk].to(chunk_target.device)
+                        * MAX_INST
+                    )
+                    chunk_target = (
+                        (chunk_target + room_offsets.unsqueeze(1)).view(-1).contiguous()
+                    )
 
-            if mean_loss <= lowest_loss:
-                lowest_loss = mean_loss
+                    calculator = AccuracyCalculator(
+                        include=tuple(["mean_average_precision_at_r"]),
+                        k=None,
+                        avg_of_avgs=True,
+                        device=chunk_embed.device,
+                    )
+                    results = calculator.get_accuracy(
+                        query=chunk_embed,
+                        query_labels=chunk_target,
+                        reference=chunk_embed,
+                        reference_labels=chunk_target,
+                    )
+                    batch_mapr_sum += (
+                        results["mean_average_precision_at_r"] * SAMPLES_PER_CHUNK
+                    )
+
+                mapr = batch_mapr_sum / BATCH_SIZE
+                mapr_sum += mapr
+
+            mean_mapr = mapr_sum / float(num_batches)
+            log_string('eval mean mapr: %f' % (mean_mapr))
+
+            if mean_mapr >= highest_mapr:
+                highest_mapr = mean_mapr
                 logger.info('Save model...')
                 savepath = str(checkpoints_dir) + '/best_model.pth'
                 log_string('Saving at %s' % savepath)
                 state = {
                     'epoch': epoch,
-                    'eval_avg_loss': mean_loss,
+                    'eval_mapr': mean_mapr,
                     'model_state_dict': classifier.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }
                 torch.save(state, savepath)
-                log_string('Saving model....')
-            log_string('Lowest loss: %f' % lowest_loss)
+                log_string(f'Saving model epoch {epoch} with mapr {mean_mapr}')
+            log_string('highest_mapr: %f' % highest_mapr)
         global_epoch += 1
 
 

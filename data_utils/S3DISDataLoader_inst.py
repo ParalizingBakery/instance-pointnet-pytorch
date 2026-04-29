@@ -79,7 +79,7 @@ class S3DISDataset(Dataset):
         current_labels = labels[selected_point_idxs]
         if self.transform is not None:
             current_points, current_labels = self.transform(current_points, current_labels)
-        return current_points, current_labels
+        return current_points, current_labels, room_idx
 
     def __len__(self):
         return len(self.room_idxs)
@@ -89,6 +89,7 @@ class ScannetDatasetWholeScene():
     def __init__(self, root, block_points=4096, split='test', test_area=5, stride=0.5, block_size=1.0, padding=0.001):
         self.block_points = block_points
         self.block_size = block_size
+        # for floating point imprecision, so points between grid are counted
         self.padding = padding
         self.root = root
         self.split = split
@@ -96,13 +97,13 @@ class ScannetDatasetWholeScene():
         self.scene_points_num = []
         assert split in ['train', 'test']
         if self.split == 'train':
-            self.file_list = [d for d in os.listdir(root) if d.find('Area_%d' % test_area) is -1]
+            self.file_list = [d for d in os.listdir(root) if f'Area_{test_area}' not in d]
         else:
-            self.file_list = [d for d in os.listdir(root) if d.find('Area_%d' % test_area) is not -1]
+            self.file_list = [d for d in os.listdir(root) if f'Area_{test_area}' in d]
         self.scene_points_list = []
         self.semantic_labels_list = []
         self.room_coord_min, self.room_coord_max = [], []
-        for file in self.file_list:
+        for file in self.file_list: # For every room
             data = np.load(root + file)
             points = data[:, :3]
             self.scene_points_list.append(data[:, :6])
@@ -119,12 +120,14 @@ class ScannetDatasetWholeScene():
         labelweights = labelweights.astype(np.float32)
         labelweights = labelweights / np.sum(labelweights)
         self.labelweights = np.power(np.amax(labelweights) / labelweights, 1 / 3.0)
-
+    
     def __getitem__(self, index):
         point_set_ini = self.scene_points_list[index]
         points = point_set_ini[:,:6]
         labels = self.semantic_labels_list[index]
+        # Looks redundant, self.room_coord_min
         coord_min, coord_max = np.amin(points, axis=0)[:3], np.amax(points, axis=0)[:3]
+        # From collector, min coordinate is already is 0.0
         grid_x = int(np.ceil(float(coord_max[0] - coord_min[0] - self.block_size) / self.stride) + 1)
         grid_y = int(np.ceil(float(coord_max[1] - coord_min[1] - self.block_size) / self.stride) + 1)
         data_room, label_room, sample_weight, index_room = np.array([]), np.array([]), np.array([]),  np.array([])
@@ -143,6 +146,7 @@ class ScannetDatasetWholeScene():
                     continue
                 num_batch = int(np.ceil(point_idxs.size / self.block_points))
                 point_size = int(num_batch * self.block_points)
+                # duplicate points to a multiple of self.block_points
                 replace = False if (point_size - point_idxs.size <= point_idxs.size) else True
                 point_idxs_repeat = np.random.choice(point_idxs, point_size - point_idxs.size, replace=replace)
                 point_idxs = np.concatenate((point_idxs, point_idxs_repeat))
